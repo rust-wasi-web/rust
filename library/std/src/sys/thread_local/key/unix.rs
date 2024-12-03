@@ -3,6 +3,8 @@ use crate::mem;
 // For WASI add a few symbols not in upstream `libc` just yet.
 #[cfg(target_os = "wasi")]
 mod libc {
+    pub use libc::*;
+
     use crate::ffi;
 
     #[allow(non_camel_case_types)]
