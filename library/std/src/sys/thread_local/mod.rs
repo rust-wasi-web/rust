@@ -115,7 +115,9 @@ pub(crate) mod guard {
             pub(crate) use solid::enable;
         } else {
             mod key;
-            pub(crate) use key::enable;
+            pub(crate) use key::{enable};
+            #[cfg(not(target_thread_local))]
+            pub(crate) use key::enable_process;
         }
     }
 }
@@ -140,7 +142,9 @@ pub(crate) mod key {
             mod unix;
             #[cfg(test)]
             mod tests;
-            pub(super) use racy::LazyKey;
+            pub(super) use racy::{LazyKey};
+            #[cfg(not(target_thread_local))]
+            pub (super) use racy::run_dtors;
             pub(super) use unix::{Key, set, at_process_exit};
             #[cfg(any(not(target_thread_local), test))]
             pub(super) use unix::get;
@@ -155,7 +159,7 @@ pub(crate) mod key {
             mod sgx;
             #[cfg(test)]
             mod tests;
-            pub(super) use racy::LazyKey;
+            pub(super) use racy::{LazyKey, run_dtors};
             pub(super) use sgx::{Key, get, set, at_process_exit};
             use sgx::{create, destroy};
         } else if #[cfg(target_os = "xous")] {

@@ -84,3 +84,18 @@ pub fn enable() {
         }
     }
 }
+
+#[cfg(not(target_thread_local))]
+pub fn enable_process() {
+    use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::sys::thread_local::key::at_process_exit;
+
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+    if !REGISTERED.swap(true, Ordering::Relaxed) {
+        unsafe { at_process_exit(run_process) };
+    }
+
+    unsafe extern "C" fn run_process() {
+        unsafe { crate::sys::thread_local::key::run_dtors() };
+    }
+}

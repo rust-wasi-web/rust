@@ -17,6 +17,9 @@ pub struct LazyKey {
     key: AtomicUsize,
     /// Destructor for the TLS value.
     dtor: Option<unsafe extern "C" fn(*mut u8)>,
+    /// Next element of process-wide destructor list.
+    #[cfg(not(target_thread_local))]
+    next: atomic::AtomicPtr<LazyKey>,
 }
 
 // Define a sentinel value that is likely not to be returned
@@ -32,18 +35,23 @@ const KEY_SENTVAL: usize = libc::PTHREAD_KEYS_MAX + 1;
 impl LazyKey {
     #[cfg_attr(bootstrap, rustc_const_unstable(feature = "thread_local_internals", issue = "none"))]
     pub const fn new(dtor: Option<unsafe extern "C" fn(*mut u8)>) -> LazyKey {
-        LazyKey { key: atomic::AtomicUsize::new(KEY_SENTVAL), dtor }
+        LazyKey {
+            key: atomic::AtomicUsize::new(KEY_SENTVAL),
+            dtor,
+            #[cfg(not(target_thread_local))]
+            next: atomic::AtomicPtr::new(crate::ptr::null_mut()),
+        }
     }
 
     #[inline]
-    pub fn force(&self) -> super::Key {
+    pub fn force(&'static self) -> super::Key {
         match self.key.load(Ordering::Acquire) {
             KEY_SENTVAL => self.lazy_init() as super::Key,
             n => n as super::Key,
         }
     }
 
-    fn lazy_init(&self) -> usize {
+    fn lazy_init(&'static self) -> usize {
         // POSIX allows the key created here to be KEY_SENTVAL, but the compare_exchange
         // below relies on using KEY_SENTVAL as a sentinel value to check who won the
         // race to set the shared TLS key. As far as I know, there is no
@@ -71,12 +79,83 @@ impl LazyKey {
             Ordering::Acquire,
         ) {
             // The CAS succeeded, so we've created the actual key
-            Ok(_) => key as usize,
+            Ok(_) => {
+                #[cfg(not(target_thread_local))]
+                if self.dtor.is_some() {
+                    unsafe { register_dtor(self) };
+                }
+                key as usize
+            }
             // If someone beat us to the punch, use their key instead
             Err(n) => unsafe {
                 super::destroy(key);
                 n
             },
+        }
+    }
+}
+
+/// POSIX does not run TLS destructors on process exit.
+/// Thus we keep our own global list.
+#[cfg(not(target_thread_local))]
+static DTORS: atomic::AtomicPtr<LazyKey> = atomic::AtomicPtr::new(crate::ptr::null_mut());
+
+/// Should only be called once per key, otherwise loops or breaks may occur in
+/// the linked list.
+#[cfg(not(target_thread_local))]
+unsafe fn register_dtor(key: &'static LazyKey) {
+    crate::sys::thread_local::guard::enable_process();
+
+    let this = <*const LazyKey>::cast_mut(key);
+    // Use acquire ordering to pass along the changes done by the previously
+    // registered keys when we store the new head with release ordering.
+    let mut head = DTORS.load(Ordering::Acquire);
+    loop {
+        key.next.store(head, Ordering::Relaxed);
+        match DTORS.compare_exchange_weak(head, this, Ordering::Release, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(new) => head = new,
+        }
+    }
+}
+
+/// This will and must only be run by the destructor callback in [`guard`].
+#[cfg(not(target_thread_local))]
+pub unsafe fn run_dtors() {
+    for _ in 0..5 {
+        let mut any_run = false;
+
+        // Use acquire ordering to observe key initialization.
+        let mut cur = DTORS.load(Ordering::Acquire);
+        while !cur.is_null() {
+            let key = unsafe { (*cur).key.load(Ordering::Acquire) };
+            let dtor = unsafe { (*cur).dtor.unwrap() };
+            cur = unsafe { (*cur).next.load(Ordering::Relaxed) };
+
+            // In LazyKey::init, we register the dtor before setting `key`.
+            // So if one thread's `run_dtors` races with another thread executing `init` on the same
+            // `LazyKey`, we can encounter a key of KEY_SENTVAL here. That means this key was never
+            // initialized in this thread so we can safely skip it.
+            if key == KEY_SENTVAL {
+                continue;
+            }
+            // If this is non-zero, then via the `Acquire` load above we synchronized with
+            // everything relevant for this key. (It's not clear that this is needed, since the
+            // release-acquire pair on DTORS also establishes synchronization, but better safe than
+            // sorry.)
+
+            let ptr = unsafe { super::get(key as _) };
+            if !ptr.is_null() {
+                unsafe {
+                    super::set(key as _, crate::ptr::null_mut());
+                    dtor(ptr as *mut _);
+                    any_run = true;
+                }
+            }
+        }
+
+        if !any_run {
+            break;
         }
     }
 }

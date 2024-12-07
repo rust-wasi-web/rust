@@ -10,7 +10,7 @@ pub(crate) fn opts() -> TargetOptions {
         has_rpath: true,
         position_independent_executables: true,
         relro_level: RelroLevel::Full,
-        has_thread_local: true,
+        has_thread_local: false, //true,
         crt_static_respected: true,
         supported_split_debuginfo: Cow::Borrowed(&[
             SplitDebuginfo::Packed,
