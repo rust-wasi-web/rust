@@ -136,7 +136,7 @@ impl LocalPointer {
 // SAFETY: the target doesn't have threads.
 unsafe impl Sync for LocalPointer {}
 
-struct Dtors (RefCell<Vec<Box<dyn FnOnce() -> bool + 'static>>>);
+struct Dtors (RefCell<Vec<Box<dyn Fn() -> bool + 'static>>>);
 // SAFETY: the target doesn't have threads.
 unsafe impl Sync for Dtors {}
 
@@ -145,49 +145,42 @@ static DTORS: Dtors = Dtors(RefCell::new(Vec::new()));
 
 /// Should only be called once per key, otherwise loops or breaks may occur in
 /// the linked list.
-unsafe fn register_dtor(dtor: impl FnOnce() -> bool + 'static) {
-    //crate::sys::thread_local::guard::enable_process();
+unsafe fn register_dtor(dtor: impl Fn() -> bool + 'static) {
+    enable_process();
 
     DTORS.0.borrow_mut().push(Box::new(dtor));
 }
 
-
 /// This will and must only be run by the destructor callback in [`guard`].
-pub unsafe fn run_dtors() {
+unsafe fn run_dtors() {
+    let mut dtors = DTORS.0.take();
+
     for _ in 0..5 {
         let mut any_run = false;
 
-        // Use acquire ordering to observe key initialization.
-        let mut cur = DTORS.load(Ordering::Acquire);
-        while !cur.is_null() {
-            let key = unsafe { (*cur).key.load(Ordering::Acquire) };
-            let dtor = unsafe { (*cur).dtor.unwrap() };
-            cur = unsafe { (*cur).next.load(Ordering::Relaxed) };
-
-            // In LazyKey::init, we register the dtor before setting `key`.
-            // So if one thread's `run_dtors` races with another thread executing `init` on the same
-            // `LazyKey`, we can encounter a key of KEY_SENTVAL here. That means this key was never
-            // initialized in this thread so we can safely skip it.
-            if key == KEY_SENTVAL {
-                continue;
-            }
-            // If this is non-zero, then via the `Acquire` load above we synchronized with
-            // everything relevant for this key. (It's not clear that this is needed, since the
-            // release-acquire pair on DTORS also establishes synchronization, but better safe than
-            // sorry.)
-
-            let ptr = unsafe { super::get(key as _) };
-            if !ptr.is_null() {
-                unsafe {
-                    super::set(key as _, crate::ptr::null_mut());
-                    dtor(ptr as *mut _);
-                    any_run = true;
-                }
-            }
+        for dtor in &dtors {
+            any_run |= dtor();
         }
 
-        if !any_run {
+        let mut new_dtors = DTORS.0.borrow_mut();
+
+        if !any_run && new_dtors.is_empty() {
             break;
         }
+
+        dtors.extend(new_dtors.drain(..));
+    }
+}
+
+/// Registers `run_dtors` for execution at process exit.
+fn enable_process() {
+    static REGISTERED: Cell<bool> = Cell::new(false);
+    if !REGISTERED.get() {
+        REGISTERED.set(true);
+        unsafe { at_process_exit(run_process) };
+    }
+
+    unsafe extern "C" fn run_process() {
+        unsafe { run_dtors() };
     }
 }

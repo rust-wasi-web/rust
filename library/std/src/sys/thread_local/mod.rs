@@ -142,7 +142,7 @@ pub(crate) mod key {
             mod unix;
             #[cfg(test)]
             mod tests;
-            pub(super) use racy::{LazyKey};
+            pub(super) use racy::LazyKey;
             #[cfg(not(target_thread_local))]
             pub (super) use racy::run_dtors;
             pub(super) use unix::{Key, set, at_process_exit};
