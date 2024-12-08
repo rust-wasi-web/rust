@@ -1,6 +1,7 @@
 //! On some targets like wasm there's no threads, so no need to generate
 //! thread locals and we can instead just use plain statics!
 
+use crate::cell::RefCell;
 use crate::cell::{Cell, UnsafeCell};
 use crate::ptr;
 
@@ -79,6 +80,10 @@ impl<T> LazyStorage<T> {
 
     #[cold]
     fn initialize(&'static self, i: Option<&mut Option<T>>, f: impl FnOnce() -> T) -> *const T {
+        unsafe {
+            register_dtor(|| Self::destroy_value(&self.value));
+        }
+
         let value = i.and_then(Option::take).unwrap_or_else(f);
         // Destroy the old value, after updating the TLS variable as the
         // destructor might reference it.
@@ -88,6 +93,13 @@ impl<T> LazyStorage<T> {
         }
         // SAFETY: we just set this to `Some`.
         unsafe { (*self.value.get()).as_ref().unwrap_unchecked() }
+    }
+
+    /// Destroy contained value.
+    /// 
+    /// Returns whether a value was contained.
+    fn destroy_value(value: &UnsafeCell<Option<T>>) -> bool {
+        unsafe { value.get().replace(None).is_some() }
     }
 }
 
@@ -123,3 +135,59 @@ impl LocalPointer {
 
 // SAFETY: the target doesn't have threads.
 unsafe impl Sync for LocalPointer {}
+
+struct Dtors (RefCell<Vec<Box<dyn FnOnce() -> bool + 'static>>>);
+// SAFETY: the target doesn't have threads.
+unsafe impl Sync for Dtors {}
+
+/// List of destructors to run at process exit.
+static DTORS: Dtors = Dtors(RefCell::new(Vec::new()));
+
+/// Should only be called once per key, otherwise loops or breaks may occur in
+/// the linked list.
+unsafe fn register_dtor(dtor: impl FnOnce() -> bool + 'static) {
+    //crate::sys::thread_local::guard::enable_process();
+
+    DTORS.0.borrow_mut().push(Box::new(dtor));
+}
+
+
+/// This will and must only be run by the destructor callback in [`guard`].
+pub unsafe fn run_dtors() {
+    for _ in 0..5 {
+        let mut any_run = false;
+
+        // Use acquire ordering to observe key initialization.
+        let mut cur = DTORS.load(Ordering::Acquire);
+        while !cur.is_null() {
+            let key = unsafe { (*cur).key.load(Ordering::Acquire) };
+            let dtor = unsafe { (*cur).dtor.unwrap() };
+            cur = unsafe { (*cur).next.load(Ordering::Relaxed) };
+
+            // In LazyKey::init, we register the dtor before setting `key`.
+            // So if one thread's `run_dtors` races with another thread executing `init` on the same
+            // `LazyKey`, we can encounter a key of KEY_SENTVAL here. That means this key was never
+            // initialized in this thread so we can safely skip it.
+            if key == KEY_SENTVAL {
+                continue;
+            }
+            // If this is non-zero, then via the `Acquire` load above we synchronized with
+            // everything relevant for this key. (It's not clear that this is needed, since the
+            // release-acquire pair on DTORS also establishes synchronization, but better safe than
+            // sorry.)
+
+            let ptr = unsafe { super::get(key as _) };
+            if !ptr.is_null() {
+                unsafe {
+                    super::set(key as _, crate::ptr::null_mut());
+                    dtor(ptr as *mut _);
+                    any_run = true;
+                }
+            }
+        }
+
+        if !any_run {
+            break;
+        }
+    }
+}
